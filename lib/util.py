@@ -27,45 +27,40 @@
 '''Miscellaneous utility classes and functions.'''
 
 
-
 import array
 import inspect
 from ipaddress import ip_address
 import logging
 import re
 import sys
-from collections.abc import Container, Mapping
+from collections import Container, Mapping
 from struct import pack, Struct
 
-# Logging utilities
 
+class LoggedClass(object):
 
-class ConnectionLogger(logging.LoggerAdapter):
-    '''Prepends a connection identifier to a logging message.'''
-    def process(self, msg, kwargs):
-        conn_id = self.extra.get('conn_id', 'unknown')
-        return f'[{conn_id}] {msg}', kwargs
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.setLevel(logging.INFO)
+        self.log_prefix = ''
+        self.throttled = 0
 
+    def log_info(self, msg, throttle=False):
+        # Prevent annoying log messages by throttling them if there
+        # are too many in a short period
+        if throttle:
+            self.throttled += 1
+            if self.throttled > 3:
+                return
+            if self.throttled == 3:
+                msg += ' (throttling later logs)'
+        self.logger.info(self.log_prefix + msg)
 
-class CompactFormatter(logging.Formatter):
-    '''Strips the module from the logger name to leave the class only.'''
-    def format(self, record):
-        record.name = record.name.rpartition('.')[-1]
-        return super().format(record)
+    def log_warning(self, msg):
+        self.logger.warning(self.log_prefix + msg)
 
-
-def make_logger(name, *, handler, level):
-    '''Return the root ElectrumX logger.'''
-    logger = logging.getLogger(name)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
-
-
-def class_logger(path, classname):
-    '''Return a hierarchical logger for a class.'''
-    return logging.getLogger(path).getChild(classname)
+    def log_error(self, msg):
+        self.logger.error(self.log_prefix + msg)
 
 
 # Method decorator.  To be used for calculations that will always
@@ -101,10 +96,13 @@ def formatted_time(t, sep=' '):
 
 def deep_getsizeof(obj):
     """Find the memory footprint of a Python object.
+
     Based on code from code.tutsplus.com: http://goo.gl/fZ0DXK
+
     This is a recursive function that drills down a Python object graph
     like a dictionary holding nested dictionaries with lists of lists
     and tuples and sets.
+
     The sys.getsizeof function does a shallow size of only. It counts each
     object inside a container as pointer only regardless of how big it
     really is.
@@ -149,13 +147,6 @@ def chunks(items, size):
         yield items[i: i + size]
 
 
-def resolve_limit(limit):
-    if limit is None:
-        return -1
-    assert isinstance(limit, int) and limit >= 0
-    return limit
-
-
 def bytes_to_int(be_bytes):
     '''Interprets a big-endian sequence of bytes as an integer'''
     return int.from_bytes(be_bytes, 'big')
@@ -166,8 +157,23 @@ def int_to_bytes(value):
     return value.to_bytes((value.bit_length() + 7) // 8, 'big')
 
 
+def int_to_varint(value):
+    '''Converts an integer to a Bitcoin-like varint bytes'''
+    if value < 0:
+        raise ValueError("attempt to write size < 0")
+    elif value < 253:
+        return pack('<B', value)
+    elif value < 2**16:
+        return b'\xfd' + pack('<H', value)
+    elif value < 2**32:
+        return b'\xfe' + pack('<I', value)
+    elif value < 2**64:
+        return b'\xff' + pack('<Q', value)
+
+
 def increment_byte_string(bs):
     '''Return the lexicographically next byte string of the same length.
+
     Return None if there is none (when the input is all 0xff bytes).'''
     for n in range(1, len(bs) + 1):
         if bs[-n] != 0xff:
@@ -186,6 +192,7 @@ class LogicalFile(object):
     def read(self, start, size=-1):
         '''Read up to size bytes from the virtual file, starting at offset
         start, and return them.
+
         If size is -1 all bytes are read.'''
         parts = []
         while size != 0:
@@ -254,11 +261,7 @@ def address_string(address):
 # See http://stackoverflow.com/questions/2532053/validate-a-hostname-string
 # Note underscores are valid in domain names, but strictly invalid in host
 # names.  We ignore that distinction.
-
-
-SEGMENT_REGEX = re.compile("(?!-)[A-Z_\\d-]{1,63}(?<!-)$", re.IGNORECASE)
-
-
+SEGMENT_REGEX = re.compile("(?!-)[A-Z_\d-]{1,63}(?<!-)$", re.IGNORECASE)
 def is_valid_hostname(hostname):
     if len(hostname) > 255:
         return False
@@ -267,91 +270,50 @@ def is_valid_hostname(hostname):
         hostname = hostname[:-1]
     return all(SEGMENT_REGEX.match(x) for x in hostname.split("."))
 
-
-VERSION_CLEANUP_REGEX = re.compile(r'([0-9.]*)')
-
-
 def protocol_tuple(s):
     '''Converts a protocol version number, such as "1.0" to a tuple (1, 0).
+
     If the version number is bad, (0, ) indicating version 0 is returned.'''
     try:
-        # clean up extra text at end of version e.g. '3.3.4CS' -> '3.3.4'
-        s = VERSION_CLEANUP_REGEX.match(s).group(1)
         return tuple(int(part) for part in s.split('.'))
     except Exception:
         return (0, )
 
-
-def version_string(ptuple):
+def protocol_version_string(ptuple):
     '''Convert a version tuple such as (1, 2) to "1.2".
     There is always at least one dot, so (1, ) becomes "1.0".'''
     while len(ptuple) < 2:
         ptuple += (0, )
     return '.'.join(str(p) for p in ptuple)
 
+def protocol_version(client_req, server_min, server_max):
+    '''Given a client protocol request, return the protocol version
+    to use as a tuple.
 
-def protocol_version(client_req, min_tuple, max_tuple):
-    '''Given a client's protocol version string, return a pair of
-    protocol tuples:
-           (negotiated version, client min request)
-    If the request is unsupported, the negotiated protocol tuple is
-    None.
+    If a mutually acceptable protocol version does not exist, return None.
     '''
-    if client_req is None:
-        client_min = client_max = min_tuple
+    if isinstance(client_req, list) and len(client_req) == 2:
+        client_min, client_max = client_req
+    elif client_req is None:
+        client_min = client_max = server_min
     else:
-        if isinstance(client_req, list) and len(client_req) == 2:
-            client_min, client_max = client_req
-        else:
-            client_min = client_max = client_req
-        client_min = protocol_tuple(client_min)
-        client_max = protocol_tuple(client_max)
+        client_min = client_max = client_req
 
-    result = min(client_max, max_tuple)
-    if result < max(client_min, min_tuple) or result == (0, ):
+    client_min = protocol_tuple(client_min)
+    client_max = protocol_tuple(client_max)
+    server_min = protocol_tuple(server_min)
+    server_max = protocol_tuple(server_max)
+
+    result = min(client_max, server_max)
+    if result < max(client_min, server_min) or result == (0, ):
         result = None
 
-    return result, client_min
+    return result
 
-
-struct_le_i = Struct('<i')
-struct_le_q = Struct('<q')
-struct_le_H = Struct('<H')
-struct_le_I = Struct('<I')
-struct_le_Q = Struct('<Q')
-struct_be_H = Struct('>H')
-struct_be_I = Struct('>I')
-structB = Struct('B')
-
-unpack_le_int32_from = struct_le_i.unpack_from
-unpack_le_int64_from = struct_le_q.unpack_from
-unpack_le_uint16_from = struct_le_H.unpack_from
-unpack_le_uint32_from = struct_le_I.unpack_from
-unpack_le_uint64_from = struct_le_Q.unpack_from
-unpack_be_uint16_from = struct_be_H.unpack_from
-unpack_be_uint32_from = struct_be_I.unpack_from
-
-pack_le_int32 = struct_le_i.pack
-pack_le_int64 = struct_le_q.pack
-pack_le_uint16 = struct_le_H.pack
-pack_le_uint32 = struct_le_I.pack
-pack_le_uint64 = struct_le_Q.pack
-pack_be_uint16 = struct_be_H.pack
-pack_be_uint32 = struct_be_I.pack
-pack_byte = structB.pack
+unpack_int32_from = Struct('<i').unpack_from
+unpack_int64_from = Struct('<q').unpack_from
+unpack_uint16_from = Struct('<H').unpack_from
+unpack_uint32_from = Struct('<I').unpack_from
+unpack_uint64_from = Struct('<Q').unpack_from
 
 hex_to_bytes = bytes.fromhex
-
-
-def pack_varint(n):
-    if n < 253:
-        return pack_byte(n)
-    if n < 65536:
-        return pack_byte(253) + pack_le_uint16(n)
-    if n < 4294967296:
-        return pack_byte(254) + pack_le_uint32(n)
-    return pack_byte(255) + pack_le_uint64(n)
-
-
-def pack_varbytes(data):
-return pack_varint(len(data)) + data

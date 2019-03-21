@@ -330,13 +330,6 @@ class ScryptMixin(object):
         else:
             return cls.HEADER_HASH(header)
 
-class SafecoinMixin(object):
-    P2PKH_VERBYTE = bytes.fromhex("3C")
-    P2SH_VERBYTES = [bytes.fromhex("55")]
-    WIF_BYTE = bytes.fromhex("BC")
-    GENESIS_HASH = ('09f5deffb9c816d82b8f696befa84681'
-                    '509274288c4529f213aeeac57999e8c9')
-    DESERIALIZER = lib_tx.DeserializerZcash
 
 class KomodoMixin(object):
     P2PKH_VERBYTE = bytes.fromhex("3C")
@@ -1409,17 +1402,6 @@ class Verus(KomodoMixin, EquihashMixin, Coin):
                 return verus_hash2b(header)
             else:
                 return verus_hash(header)
-            
-class Safecoin(SafecoinMixin, EquihashMixin, Coin):
-    NAME = "Safecoin"
-    SHORTNAME = "SAFE"
-    NET = "mainnet"
-    TX_COUNT = 10000
-    TX_COUNT_HEIGHT = 5000
-    TX_PER_BLOCK = 2
-    RPC_PORT = 8771
-    REORG_LIMIT = 800
-    PEERS = []
 
 
 class Einsteinium(Coin):
